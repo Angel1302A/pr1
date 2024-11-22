@@ -1,0 +1,776 @@
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <map>
+#include <set>
+#include <vector>
+#include <queue>
+#include <filesystem>
+#include <fstream>
+#include "json.hpp"
+
+namespace fs = std::filesystem;
+using namespace std;
+using json = nlohmann::json;
+
+const set<string> operators{ "=", "!=", ">", "<", ">=", "<=", "AND", "OR" };
+
+vector<string> split(const std::string& str, const string& delim = " ") {
+    vector<string> result;
+    result.reserve(20);
+
+    size_t start = 0;
+    size_t end = str.find(delim);
+
+    while (end != std::string::npos) {
+        string s = str.substr(start, end - start);
+        if (!s.empty())
+            result.push_back(std::move(s));
+        start = end + delim.size();
+        end = str.find(delim, start);
+    }
+
+    string s = str.substr(start);
+    if (!s.empty())
+        result.push_back(std::move(s));
+
+    return result;
+}
+
+std::string join(const std::vector<std::string>& elems, std::string det = " ") {
+    std::string str;
+    bool is_first = true;
+    for (const auto& elem : elems) {
+        if (!is_first)
+            str = str + det;
+        else
+            is_first = false;
+        str = str + elem;
+    }
+    return str;
+}
+
+size_t count_lines(const string& path) {
+    ifstream file(path);
+    string input;
+    size_t n = 0;
+    while (getline(file, input)) {
+        n++;
+    }
+    file.close();
+    return n;
+}
+
+vector<string> pars_command(string str) {
+    const char det = ',';
+    size_t start{ str.find(det) };
+    for (size_t end_replace = min(str.find("WHERE"), str.find("VALUES"));
+        end_replace > start;
+        start = str.find(det, start + 1)) {
+        str.replace(start, 1, 1, ' ');
+    }
+
+    vector<string> words;
+
+    stringstream sstr;
+    sstr << str;
+
+    while (sstr) {
+        string word;
+        sstr >> word;
+        if (!word.empty())
+            words.push_back(word);
+    }
+
+    return words;
+}
+
+class DB {
+    struct config {
+        string name;
+        size_t tuples_limit;
+        map<string, vector<string>> tabs;
+
+        void readJsonFile(std::string filename) {
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                std::cout << "Unable to open file" << std::endl;
+                exit(1);
+            }
+
+            json jsonObject;
+            file >> jsonObject;
+
+            name = jsonObject["name"];
+            tuples_limit = jsonObject["tuples_limit"];
+            json structure = jsonObject["structure"];
+
+            for (json::iterator it = structure.begin(); it != structure.end(); ++it) {
+                std::string table = it.key();
+                vector<string> colums;
+                for (const auto& col : it.value()) {
+                    colums.push_back(col);
+                }
+                tabs[table] = colums;
+            }
+
+            file.close();
+        }
+
+    };
+
+    config my_config;
+
+    string get_col_name(const string& tab_name, const string& col_name) {
+        return tab_name + '.' + col_name;
+    }
+
+    vector<string> get_colums(const string& tab_name) {
+        vector<string> colums;
+        for (const auto& colum : my_config.tabs[tab_name])
+            colums.push_back(get_col_name(tab_name, colum));
+        return colums;
+    }
+
+    size_t get_pk_sequence(const string& tab_name) {
+        size_t n = 0;
+        ifstream inp;
+        inp.open(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence");
+        if (inp.is_open()) {
+            inp >> n;
+            inp.close();
+        }
+        return n;
+    }
+
+    void set_pk_sequence(const string& tab_name, const size_t& n) {
+        ofstream out;
+        out.open(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence");
+        if (out.is_open()) {
+            out << n;
+            out.close();
+        }
+    }
+
+    void create_pk_sequence_file(const string& tab_name) {
+        if (!fs::exists(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence")) {
+            set_pk_sequence(tab_name, 0);
+        }
+    }
+
+    bool status_lock_tab(const string& tab_name) {
+        ifstream inp;
+        inp.open(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence" + tab_name + "_lock");
+        if (inp.is_open()) {
+            int state;
+            inp >> state;
+            inp.close();
+            if (state != 0)
+                return true;
+        }
+        return false;
+    }
+
+    void change_lock_tab(const string& tab_name, bool state) {
+        ofstream out;
+        out.open(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence" + tab_name + "_lock");
+        if (out.is_open()) {
+            if (state)
+                out << 1;
+            else
+                out << 0;
+            out.close();
+        }
+    }
+
+    void lock_tab(const string& tab) {
+        bool need_wait = true;
+        while (need_wait) {
+            need_wait = status_lock_tab(tab);
+        }
+        change_lock_tab(tab, true);
+    }
+
+    void unlock_tab(const string& tab) {
+        change_lock_tab(tab, false);
+    }
+
+    void create_lock_file(const string& tab_name) {
+        if (!fs::exists(my_config.name + '/' + tab_name + '/' + tab_name + "_pk_sequence" + tab_name + "_lock")) {
+            change_lock_tab(tab_name, false);
+        }
+    }
+
+    queue<vector<string>> data(const string& path) {
+        queue<vector<string>> result;
+        ifstream file(path);
+        string input;
+        bool is_first = true;
+
+        while (getline(file, input)) {
+            if (is_first) {
+                is_first = false;
+                continue;
+            }
+
+            result.push(split(input, ", "));
+        }
+        file.close();
+        return result;
+    }
+
+    void print_line(const vector<string>& words, ofstream& out, const bool& is_first = false) {
+        if (!is_first)
+            out << std::endl;
+        out << words[0];
+        for (int i = 1; i < words.size(); i++)
+            out << ", " << words[i];
+    }
+
+    void create_cvs(const string& path, const string& tab_name) {
+        if (!fs::exists(path)) {
+            ofstream out;
+            out.open(path);
+            if (out.is_open()) {
+                print_line(my_config.tabs[tab_name], out, true);
+                out.close();
+            }
+        }
+    }
+
+    void print_tab(vector<vector<string>>& tab, const string& tab_name, size_t cvs_num = 1, size_t i = 0) {
+        string path = my_config.name + '/' + tab_name + '/' + to_string(cvs_num) + ".cvs";
+        create_cvs(path, tab_name);
+
+        if (tab.empty())
+            return;
+
+        size_t n = count_lines(path), pk_sequence;
+
+        bool need_add_pk_sequence = my_config.tabs[tab_name].size() > tab[0].size();
+
+        if (need_add_pk_sequence)
+            pk_sequence = get_pk_sequence(tab_name);
+
+        ofstream out;
+        out.open(path, ios_base::app);
+        if (out.is_open()) {
+            while (n <= my_config.tuples_limit && i < tab.size()) {
+
+                if (need_add_pk_sequence) {
+                    tab[i].push_back('\'' + to_string(pk_sequence) + '\'');
+                    pk_sequence++;
+                }
+
+                print_line(tab[i], out);
+                i++;
+                n++;
+            }
+            out.close();
+        }
+
+        if (need_add_pk_sequence)
+            set_pk_sequence(tab_name, pk_sequence);
+
+        if (i < tab.size()) {
+            cvs_num++;
+            print_tab(tab, tab_name, cvs_num, i);
+        }
+    }
+
+    void create_DB_files() {
+        if (!fs::exists(my_config.name))
+            fs::create_directory(my_config.name);
+
+        for (map<string, vector<string>>::iterator iter = my_config.tabs.begin();
+            iter != my_config.tabs.end();
+            ++iter) {
+            string path = my_config.name + '/' + iter->first;
+            string path_for_cvs = path + "/1.cvs";
+
+            iter->second.push_back(iter->first + "_pk");
+
+            if (!fs::exists(path))
+                fs::create_directory(path);
+
+            create_cvs(path_for_cvs, iter->first);
+            create_lock_file(iter->first);
+            create_pk_sequence_file(iter->first);
+        }
+    }
+
+    bool calc_condition_string(const string& a, const string& b, const string& op) {
+        if (op == "=")
+            return a == b;
+        if (op == "!=")
+            return a != b;
+        if (op == ">")
+            return a > b;
+        if (op == "<")
+            return a < b;
+        if (op == ">=")
+            return a >= b;
+        if (op == "<=")
+            return a <= b;
+        return false;
+    }
+
+    bool conditions_and(const string& conditions, const vector<string>& data) { //TODO WORDS
+        for (auto i : split(conditions, "AND")) {
+            auto words = split(i);
+
+            switch (words.size()) {
+            case 1:
+                if (words[0] != "true")
+                    return false;
+                break;
+            case 3:
+                if (words[0][0] != '\'')
+                    words[0] = data[stoi(words[0])];
+                if (words[2][0] != '\'')
+                    words[2] = data[stoi(words[2])];
+                if (!calc_condition_string(words[0], words[2], words[1]))
+                    return false;
+                break;
+            default:
+                cout << "errror add_conditions num - " << words.size() << ": " << i << endl;
+                return false;
+            }
+
+        }
+        return true;
+    }
+
+    bool calc_condition(const vector<string>& conditions, const vector<string>& data) {
+        if (conditions.empty())
+            return true;
+        string line = join(conditions);
+        for (auto& i : split(line, "OR")) {
+            if (conditions_and(i, data))
+                return true;
+        }
+        return false;
+    }
+
+    vector<int> number_need_colums(const vector<string>& need_colums, const vector<string>& colums) {
+        vector<int> need_colums_num;
+        for (const auto& colum : need_colums) {
+            size_t n = need_colums_num.size();
+            for (size_t i = 0; i < colums.size(); i++)
+                if (colum == colums[i]) {
+                    need_colums_num.push_back(i);
+                    break;
+                }
+            if (n == need_colums_num.size())
+                need_colums_num.push_back(-1);
+        }
+        return need_colums_num;
+    }
+
+    string get_need_colums(const vector<string>& line, const vector<int>& need_colums_num) {
+        string res = "";
+        for (const auto& i : need_colums_num) {
+            if (i != -1) {
+                if (res != "")
+                    res += ", ";
+                res += line[i];
+            }
+        }
+        return res;
+    }
+
+    void select_colums_with_conditions(queue<vector<string>>& tab,
+        const vector<int>& need_colums_num,
+        const vector<string>& conditions,
+        vector<string>& result) {
+
+        while (!tab.empty()) {
+            if (calc_condition(conditions, tab.front())) {
+                auto res = get_need_colums(tab.front(), need_colums_num);
+                if (res != "")
+                    result.push_back(res);
+            }
+            tab.pop();
+        }
+    }
+
+    void select_colums_without_conditions(queue<vector<string>>& tab,
+        const vector<int>& need_colums_num,
+        vector<string>& result) {
+
+        while (!tab.empty()) {
+            auto res = get_need_colums(tab.front(), need_colums_num);
+            if (res != "")
+                result.push_back(res);
+            tab.pop();
+        }
+    }
+
+    vector<string> create_cur_conditions(const vector<string>& tab_colums,
+        const vector<string>& conditions,
+        const bool is_last_condition = true) {
+
+        vector<string> result;
+
+        for (const auto& i : conditions) {
+
+            if (result.size() > 0 && result[result.size() - 1] == "true")
+                if (i == "AND" || i == "OR") {
+                    result.push_back(i);
+                    continue;
+                }
+                else
+                    continue;
+
+            if (i[0] == '\'' || operators.find(i) != operators.end()) {
+
+                result.push_back(i);
+                continue;
+            }
+
+            auto s = result.size();
+            for (size_t j = 0; j < tab_colums.size(); j++) {
+                if (tab_colums[j] == i) {
+                    result.push_back(to_string(j));
+                    break;
+                }
+            }
+
+            if (s == result.size())
+                if (is_last_condition)
+                    result.push_back("\'\'");
+                else {
+                    while (!result.empty() &&
+                        (result[result.size() - 1] != "AND" || result[result.size() - 1] != "OR")) {
+                        result.pop_back();
+                    }
+                    result.push_back("true");
+                }
+        }
+
+        return result;
+    }
+
+    vector<string> select_colums(const vector<string>& colums,
+        const string& tab_name,
+        const vector<string>& conditions) {
+
+        vector<int> need_colums_num = number_need_colums(colums, get_colums(tab_name));
+        vector<string> result;
+
+        size_t cvs_num = 1;
+        string path = my_config.name + '/' + tab_name + '/' + to_string(cvs_num) + ".cvs";
+
+        while (fs::exists(path)) {
+            auto tab = data(path);
+
+            if (conditions.size() == 0)
+                select_colums_without_conditions(tab, need_colums_num, result);
+            else
+                select_colums_with_conditions(tab, need_colums_num, conditions, result);
+
+            cvs_num++;
+            path = my_config.name + '/' + tab_name + '/' + to_string(cvs_num) + ".cvs";
+        }
+        return result;
+    }
+
+    vector<string> select_from_tab(const string& tab_name,
+        const vector<string>& colums,
+        const vector<string>& conditions) {
+
+        lock_tab(tab_name);
+        auto data_item = select_colums(colums, tab_name, conditions);
+        unlock_tab(tab_name);
+
+        return data_item;
+    }
+
+    vector<int> get_need_num_colums_from_bd(const vector<string>& colums,
+        const vector<string>& tabs) {
+
+        vector<int> need_colums_num;
+
+        for (const auto& colum : colums) {
+            int n = 0;
+            for (const auto& tab : tabs) {
+                auto t = colum.find('.');
+                if (t == string::npos || colum.substr(0, t) != tab) {
+                    n += my_config.tabs[tab].size();
+                    continue;
+                }
+                for (const auto& k : get_colums(tab))
+                    if (colum == k) {
+                        need_colums_num.push_back(n);
+                        break;
+                    }
+                    else {
+                        n++;
+                    }
+                break;
+            }
+        }
+
+        return need_colums_num;
+    }
+
+    void print_select_data(ostream& out,
+        const vector<vector<string>>& data,
+        string& line,
+        const size_t&& i = 0) {
+
+        if (i < data.size()) {
+            string line_prev = line;
+            for (const auto& j : data[i]) {
+                if (i != 0) {
+                    line += ", ";
+                    line += j;
+                }
+                else {
+                    line = j;
+                }
+                print_select_data(out, data, line, i + 1);
+                if (i == data.size() - 1) {
+                    out << line << endl;
+                    line = line_prev;
+                }
+                line = line_prev;
+            }
+            if (i == data.size() - 1)
+                line = line_prev;
+        }
+    }
+
+    void print_select_data_with_conditions(const vector<string>& tabs,
+        const vector<string>& conditions,
+        const vector<vector<string>>& data,
+        const vector<int>& need_colums_num) {
+
+        vector<string> colums;
+        stringstream for_out;
+        string line;
+        print_select_data(for_out, data, line);
+
+        for (const auto& tab : tabs)
+            for (const auto& colum : get_colums(tab))
+                colums.push_back(colum);
+
+        auto cur_conditions = create_cur_conditions(colums, conditions);
+
+        while (getline(for_out, line)) {
+            auto line_data = split(line, ", ");
+            if (calc_condition(cur_conditions, line_data)) {
+                cout << get_need_colums(line_data, need_colums_num) << endl;
+            }
+        }
+    }
+
+    void delete_lines(const string& tab_name, const vector<string>& conditions) {
+
+        vector<string> cur_conditions = create_cur_conditions(get_colums(tab_name), conditions);
+
+        size_t cvs_num = 1;
+        string path = my_config.name + '/' + tab_name + '/' + to_string(cvs_num) + ".cvs";
+
+        while (fs::exists(path)) {
+            auto tab = data(path);
+            vector<vector<string>> result;
+            result.reserve(my_config.tuples_limit);
+            while (!tab.empty()) {
+                if (!calc_condition(cur_conditions, tab.front())) {
+                    result.push_back(tab.front());
+                }
+                tab.pop();
+            }
+
+            fs::remove(path);
+            print_tab(result, tab_name);
+
+            cvs_num++;
+            path = my_config.name + '/' + tab_name + '/' + to_string(cvs_num) + ".cvs";
+        }
+    }
+
+public:
+    DB() {
+        my_config.readJsonFile("schema.json");
+
+        create_DB_files();
+    }
+
+    void select(const vector<string>& colums, const vector<string>& tabs, const vector<string>& conditions) {
+        bool for_one_tab = tabs.size() == 1;
+        vector<vector<string>> data;
+        vector<string> data_tabs;
+        for (const auto& tab : std::set<std::string>(tabs.begin(), tabs.end()))
+            if (my_config.tabs.find(tab) != my_config.tabs.end()) {
+                auto tab_colums = get_colums(tab);
+                vector<string> cur_conditions = create_cur_conditions(tab_colums, conditions, for_one_tab);
+                vector<string> data_item;
+                if (for_one_tab)
+                    data_item = select_from_tab(tab, colums, cur_conditions);
+                else
+                    data_item = select_from_tab(tab, tab_colums, cur_conditions);
+                if (!data_item.empty()) {
+                    data.push_back(data_item);
+                    data_tabs.push_back(tab);
+                }
+            }
+
+        if (data.empty())
+            return;
+
+        if (for_one_tab) {
+            for (const auto& line : data[0])
+                cout << line << endl;
+            /*string line;
+            print_select_data(cout, data, line);*/
+        }
+        else {
+            vector<int> need_colums_num = get_need_num_colums_from_bd(colums, data_tabs);
+            print_select_data_with_conditions(data_tabs, conditions, data, need_colums_num);
+        }
+        cout << endl;
+    }
+
+    void insert(vector<string> line, const string& tab_name) {
+        vector<vector<string>> data;
+        data.push_back(line);
+        if (my_config.tabs.find(tab_name) != my_config.tabs.end()
+            && line.size() == my_config.tabs[tab_name].size() - 1) {
+
+            lock_tab(tab_name);
+            print_tab(data, tab_name);
+            unlock_tab(tab_name);
+        }
+    }
+
+    void del(const vector<string>& tabs,
+        const vector<string>& conditions) {
+
+        for (const auto& i : tabs)
+            if (my_config.tabs.find(i) != my_config.tabs.end()) {
+                lock_tab(i);
+                delete_lines(i, conditions);
+                unlock_tab(i);
+            }
+    }
+};
+
+void pars_select_and_delete(const vector<string>& comand_words,
+    vector<string>& colums,
+    vector<string>& tabs,
+    vector<string>& conditions) {
+
+    size_t i;
+
+    for (i = 1; i < comand_words.size(); i++)
+        if (comand_words[i] == "FROM")
+            break;
+        else
+            colums.push_back(comand_words[i]);
+
+    for (i++; i < comand_words.size(); i++)
+        if (comand_words[i] == "WHERE")
+            break;
+        else
+            tabs.push_back(comand_words[i]);
+
+    for (i++; i < comand_words.size(); i++)
+        conditions.push_back(comand_words[i]);
+}
+
+void parseValues(const std::vector<std::string>& words,
+    const size_t& start,
+    std::vector<std::string>& values) {
+
+    std::string concatenatedString = words[start];
+    for (size_t i = start + 1; i < words.size(); i++) {
+        concatenatedString += ' ' + words[i];
+    }
+
+    std::istringstream stringStream(concatenatedString);
+    std::string token;
+
+    for (size_t index = 0; std::getline(stringStream, token, '\''); index++) {
+        if (index % 2 == 1) {
+            values.push_back('\'' + token + '\'');
+        }
+    }
+}
+
+void pars_insert(const vector<string>& comand_words,
+    vector<string>& colums,
+    vector<string>& tabs) {
+
+    size_t i;
+
+    for (i = 2; i < comand_words.size(); i++)
+        if (comand_words[i] == "VALUES")
+            break;
+        else
+            tabs.push_back(comand_words[i]);
+
+    if (i < comand_words.size())
+        parseValues(comand_words, i, colums);
+
+}
+
+void transaction(const vector<string>& comand_words, DB& myDB) {
+    vector<string> colums;
+    vector<string> tabs;
+    vector<string> conditions;
+
+    if (comand_words[0] == "SELECT") {
+        pars_select_and_delete(comand_words, colums, tabs, conditions);
+        myDB.select(colums, tabs, conditions);
+    }
+    else if (comand_words[0] == "INSERT" && comand_words[1] == "INTO") {
+        pars_insert(comand_words, colums, tabs);
+        for (const auto& tab : tabs)
+            myDB.insert(colums, tab);
+    }
+    else if (comand_words[0] == "DELETE") {
+        pars_select_and_delete(comand_words, colums, tabs, conditions);
+        myDB.del(tabs, conditions);
+    }
+}
+
+bool check_command(const vector<string>& command_words) {
+    if (command_words.size() < 3) {
+        return false;
+    }
+
+    if (command_words[0] == "SELECT" && command_words.size() >= 4 &&
+        find(command_words.begin(), command_words.end(), "FROM") != command_words.end()) {
+        return true;
+    }
+
+    if (command_words[0] == "INSERT" && command_words[1] == "INTO" && command_words.size() > 3) {
+        return true;
+    }
+
+    if (command_words[0] == "DELETE" && command_words[1] == "FROM" && command_words.size() >= 3) {
+        return true;
+    }
+
+    return false;
+}
+
+
+int main() {
+    DB myDB;
+
+    string comand;
+    while (getline(cin, comand, ';')) {
+        vector<string> command_words = pars_command(comand);
+
+        if (check_command(command_words))
+            transaction(command_words, myDB);
+
+        if (!command_words.empty() && command_words[0] == "EXIT")
+            break;
+    }
+
+    return 0;
+}
